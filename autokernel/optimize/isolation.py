@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from autokernel.artifact.kinds import MODULE, evaluate_execution_signal
+from autokernel.verification.ceiling import CeilingError, gate_basis_for_workload
 from autokernel.workload import ParitySpec
 from autokernel.workload.launcher import run_mode
 from autokernel.workload.result import (
@@ -42,6 +44,7 @@ __all__ = [
     "IsolationReport",
     "TrialRecord",
     "artifact_ids_in",
+    "artifact_kinds_in",
     "dispatch_counts_for",
     "run_isolation_trials",
 ]
@@ -64,6 +67,9 @@ class TrialRecord:
     candidate_calls: int = 0
     runtime_fallbacks: int = 0
     scopes_selected: tuple[str, ...] = ()
+    target_kinds: tuple[str, ...] = ()
+    execution_evidence: Mapping[str, Any] = field(default_factory=dict)
+    gate_basis: Mapping[str, Any] = field(default_factory=dict)
     parity_passed: bool | None = None
     parity_reason: str = ""
     median_wall_seconds: float | None = None
@@ -83,10 +89,41 @@ class TrialRecord:
         )
 
     @property
+    def ran(self) -> bool:
+        """Did every artifact in this trial demonstrably execute?
+
+        Each kind declares its own proof (``artifact.kinds``): a kernel counts
+        candidate calls, an attention backend echoes which implementation ran,
+        a schedule transform counts hook invocations. Asserting the kernel
+        counter for all of them would read "did not run" as "ran" for the kinds
+        that never touch it -- and reading a timing whose intervention never
+        happened is the failure this whole check exists for.
+        """
+        return not self.execution_failures
+
+    @property
+    def execution_failures(self) -> tuple[str, ...]:
+        """Per-kind reasons this trial cannot be read as differentiated."""
+        kinds = self.target_kinds or (MODULE,)
+        # A record always carries the dispatch counter as a field, so it is
+        # evidence even when no richer mapping was collected. Kinds whose
+        # signal is not the dispatch counter still find nothing here, which is
+        # the correct answer rather than a convenient one.
+        evidence = dict(self.execution_evidence) or {
+            "candidate_calls": self.candidate_calls
+        }
+        reasons: list[str] = []
+        for kind in kinds:
+            ran, reason = evaluate_execution_signal(kind, evidence)
+            if not ran:
+                reasons.append(f"{kind}: {reason}")
+        return tuple(reasons)
+
+    @property
     def worthwhile(self) -> bool:
-        """Dispatched at least once and did not make the model slower."""
+        """Demonstrably ran and did not make the model slower."""
         return (
-            self.candidate_calls > 0
+            self.ran
             and self.end_to_end_speedup is not None
             and self.end_to_end_speedup > 1.0
         )
@@ -100,6 +137,11 @@ class TrialRecord:
             "candidate_calls": self.candidate_calls,
             "runtime_fallbacks": self.runtime_fallbacks,
             "scopes_selected": list(self.scopes_selected),
+            "target_kinds": list(self.target_kinds),
+            "execution_evidence": dict(self.execution_evidence),
+            "ran": self.ran,
+            "execution_failures": list(self.execution_failures),
+            "gate_basis": dict(self.gate_basis),
             "parity_passed": self.parity_passed,
             "parity_reason": self.parity_reason,
             "median_wall_seconds": self.median_wall_seconds,
@@ -185,6 +227,61 @@ def artifact_ids_in(artifact_root: Path) -> tuple[str, ...]:
     return tuple(ids)
 
 
+def artifact_kinds_in(artifact_root: Path) -> dict[str, str]:
+    """Map artifact id -> declared ``operation.target_kind``.
+
+    The kind decides which execution signal a trial must assert, so a bundle
+    that does not declare one is read as ``module``: the most constrained kind,
+    and the one whose signal is hardest to satisfy by accident.
+    """
+    kinds: dict[str, str] = {}
+    for manifest in sorted(Path(artifact_root).glob("*/artifact.json")):
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise IsolationError(f"cannot read {manifest}: {exc}") from exc
+        artifact_id = payload.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            continue
+        operation = payload.get("operation")
+        kind = MODULE
+        if isinstance(operation, Mapping):
+            declared = operation.get("target_kind")
+            if isinstance(declared, str) and declared:
+                kind = declared
+        kinds[artifact_id] = kind
+    return kinds
+
+
+def execution_evidence_for(
+    payload: Mapping[str, Any],
+    counts: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Collect every execution signal a runtime reported, for any kind.
+
+    Kernel kinds read ``candidate_calls`` from the dispatch counts; attention
+    and schedule-transform kinds read fields the runtime writes alongside the
+    dispatch decisions. Absent fields stay absent rather than defaulting to
+    zero, because "the runtime never reported this" and "it reported zero" must
+    not collapse into the same verdict.
+    """
+    evidence: dict[str, Any] = {"candidate_calls": counts.get("candidate_calls")}
+    for source_key in ("loop_transform", "attention", "execution_evidence"):
+        source = payload.get(source_key)
+        if isinstance(source, Mapping):
+            for key, value in source.items():
+                evidence.setdefault(key, value)
+    for key in (
+        "attention_backend",
+        "effective_backend",
+        "steps_skipped",
+        "hook_invocations",
+    ):
+        if key in payload and key not in evidence:
+            evidence[key] = payload[key]
+    return evidence
+
+
 def dispatch_counts_for(
     payload: Mapping[str, Any],
     artifact_ids: Sequence[str] | None = None,
@@ -258,6 +355,7 @@ def run_isolation_trials(
     ids = tuple(artifact_ids) if artifact_ids is not None else artifact_ids_in(artifact_root)
     if not ids:
         raise IsolationError(f"no artifacts found under {artifact_root}")
+    artifact_kinds = artifact_kinds_in(artifact_root)
 
     plan: list[tuple[str, tuple[str, ...]]] = [
         (artifact_id, (artifact_id,)) for artifact_id in ids
@@ -276,6 +374,7 @@ def run_isolation_trials(
                 native=native,
                 workload=workload,
                 base_env=base_env,
+                artifact_kinds=artifact_kinds,
             )
         )
 
@@ -294,6 +393,7 @@ def run_isolation_trials(
                     native=native,
                     workload=workload,
                     base_env=base_env,
+                    artifact_kinds=artifact_kinds,
                 )
             )
 
@@ -319,6 +419,7 @@ def _run_one_trial(
     native: Any,
     workload: Any,
     base_env: Mapping[str, str] | None,
+    artifact_kinds: Mapping[str, str],
 ) -> TrialRecord:
     trial_dir = output_dir / trial_name
     trial_dir.mkdir(parents=True, exist_ok=True)
@@ -349,15 +450,30 @@ def _run_one_trial(
             trial=trial_name,
             artifact_ids=trial_ids,
             status="error",
+            target_kinds=tuple(
+                dict.fromkeys(
+                    artifact_kinds.get(artifact_id, MODULE)
+                    for artifact_id in trial_ids
+                )
+            ),
             native_median_wall_seconds=native.median_wall_seconds,
             error=f"{type(exc).__name__}: {exc}",
         )
 
     counts: dict[str, Any] = {"calls": 0, "candidate_calls": 0, "runtime_fallbacks": 0, "scopes": ()}
+    diagnostics: dict[str, Any] = {}
     with suppress(Exception):
-        counts = dispatch_counts_for(
-            json.loads(diagnostics_path.read_text(encoding="utf-8")), trial_ids
-        )
+        diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        counts = dispatch_counts_for(diagnostics, trial_ids)
+    # When the diagnostics could not be read at all, report no evidence rather
+    # than zeroed counters: an unreadable runtime record is not proof of a
+    # no-op, and must not be read as one.
+    evidence = (
+        execution_evidence_for(diagnostics, counts) if diagnostics else {}
+    )
+    trial_kinds = tuple(
+        dict.fromkeys(artifact_kinds.get(artifact_id, MODULE) for artifact_id in trial_ids)
+    )
 
     frame_atol, frame_rtol = (
         workload.parity or ParitySpec()
@@ -369,14 +485,17 @@ def _run_one_trial(
         atol=frame_atol,
         rtol=frame_rtol,
     )
+    # The gate is derived from this workload's own Amdahl ceiling when it
+    # declares a profiled share, so a candidate is asked for a share of what is
+    # achievable rather than a flat number that may be unreachable.
+    try:
+        gate_basis = gate_basis_for_workload(workload)
+    except (CeilingError, AttributeError, TypeError, ValueError):
+        gate_basis = {"gate": 1.01, "basis": "default", "rule": "fallback 1.01"}
     performance = classify_end_to_end(
         native,
         candidate,
-        min_speedup=(
-            workload.performance.min_end_to_end_speedup
-            if getattr(workload, "performance", None) is not None
-            else 1.01
-        ),
+        min_speedup=float(gate_basis["gate"]),
         max_peak_memory_regression=(
             workload.performance.max_peak_memory_regression
             if getattr(workload, "performance", None) is not None
@@ -392,6 +511,9 @@ def _run_one_trial(
         candidate_calls=int(counts["candidate_calls"]),
         runtime_fallbacks=int(counts["runtime_fallbacks"]),
         scopes_selected=tuple(counts["scopes"]),
+        target_kinds=trial_kinds,
+        execution_evidence=evidence,
+        gate_basis=gate_basis,
         parity_passed=bool(parity.get("passed")),
         parity_reason=str(parity.get("reason") or ""),
         median_wall_seconds=candidate.median_wall_seconds,

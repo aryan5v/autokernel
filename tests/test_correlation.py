@@ -760,3 +760,106 @@ def test_ambiguous_op_only_row_remains_unmatched():
     assert all(region.cuda_time_us == 0.0 for region in correlated)
     assert len(unmatched) == 1
     assert unmatched[0].op_key == "aten::mul"
+
+
+def test_named_range_is_authoritative_and_nested_rows_are_not_added():
+    """Cosmos regression: nested operator rows are children, not extra work.
+
+    Summing the named record_function range's inclusive time together with the
+    self time of the operator rows inside it inflated Cosmos's transformer
+    attribution from 275.7s to 485.1s.
+    """
+    region_name = "transformer.blocks"
+    profiler_rows = [
+        # The named range: one per invocation, inclusive duration.
+        OperatorHotspot(
+            name=region_name,
+            op_key=region_name,
+            calls=100,
+            cuda_time_us=2757.0,
+            self_cuda_time_us=0.0,
+            parent_module="transformer",
+        ),
+        # Kernels that ran *inside* that range and also match the region.
+        OperatorHotspot(
+            name="aten::mm",
+            op_key="aten::mm",
+            calls=4800,
+            cuda_time_us=1800.0,
+            self_cuda_time_us=1800.0,
+            parent_module="transformer.blocks",
+        ),
+        OperatorHotspot(
+            name="aten::add",
+            op_key="aten::add",
+            calls=4800,
+            cuda_time_us=294.0,
+            self_cuda_time_us=294.0,
+            parent_module="transformer.blocks",
+        ),
+    ]
+    fx_regions = [
+        GraphRegion.build(
+            name=region_name,
+            operations=["aten::mm", "aten::add"],
+            inputs=[_tensor("x", (2, 128))],
+            parent_module="transformer.blocks",
+            calls=100,
+        ),
+    ]
+
+    correlated, _ = correlate_profiler_to_regions(
+        profiler_rows,
+        fx_regions,
+        total_cuda_time_us=10_000.0,
+    )
+
+    region = correlated[0]
+    # The named range alone, not 2757 + 1800 + 294 = 4851.
+    assert region.cuda_time_us == 2757.0
+    assert region.self_cuda_time_us == 2757.0
+    # And the range count, not the aten-event count.
+    assert region.calls == 100
+    assert region.attributes["e2e_share_pct"] == 27.57
+
+
+def test_without_a_named_range_operator_rows_use_exclusive_time():
+    profiler_rows = [
+        OperatorHotspot(
+            name="aten::mm",
+            op_key="aten::mm",
+            calls=40,
+            cuda_time_us=900.0,
+            self_cuda_time_us=800.0,
+            parent_module="blocks.0",
+        ),
+        OperatorHotspot(
+            name="aten::add",
+            op_key="aten::add",
+            calls=40,
+            cuda_time_us=100.0,
+            self_cuda_time_us=100.0,
+            parent_module="blocks.0",
+        ),
+    ]
+    fx_regions = [
+        GraphRegion.build(
+            name="unnamed_region",
+            operations=["aten::mm", "aten::add"],
+            inputs=[_tensor("x", (2, 128))],
+            parent_module="blocks.0",
+            calls=40,
+        ),
+    ]
+
+    correlated, _ = correlate_profiler_to_regions(
+        profiler_rows,
+        fx_regions,
+        total_cuda_time_us=10_000.0,
+    )
+
+    region = correlated[0]
+    assert region.cuda_time_us == 1000.0
+    assert region.self_cuda_time_us == 900.0
+    # Bounded from below by the largest single row, never their sum.
+    assert region.calls == 40

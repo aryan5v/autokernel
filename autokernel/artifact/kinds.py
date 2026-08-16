@@ -39,6 +39,9 @@ __all__ = [
     "SCHEDULE_TRANSFORM",
     "SUBGRAPH",
     "TargetKind",
+    "backend_echo_evidence",
+    "counter_evidence",
+    "evaluate_execution_signal",
     "execution_signal_for",
     "known_target_kinds",
     "register_target_kind",
@@ -94,6 +97,11 @@ class TargetKind:
     #: a counter or echo the runtime emits, named here so a measurement can be
     #: checked rather than assumed. See the class docstring.
     execution_signal: str = ""
+    #: The machine-evaluable form of ``execution_signal``. Takes the evidence a
+    #: runtime reported and returns ``(ran, reason)``. A prose signal nothing
+    #: can evaluate is how the incident in the class docstring happened twice,
+    #: so registration requires this too.
+    evidence_check: Any = None
 
     @property
     def permitted(self) -> frozenset[str]:
@@ -101,6 +109,56 @@ class TargetKind:
 
 
 _REGISTRY: dict[str, TargetKind] = {}
+
+
+def counter_evidence(*names: str) -> Any:
+    """Evidence check: at least one of ``names`` counted above zero.
+
+    A missing counter is not zero -- it means the runtime never reported the
+    thing, which is exactly the case that must not be read as "ran".
+    """
+
+    def check(observed: Mapping[str, Any]) -> tuple[bool, str]:
+        missing = [name for name in names if observed.get(name) is None]
+        if missing:
+            return False, f"no evidence reported for {', '.join(sorted(missing))}"
+        total = 0
+        for name in names:
+            try:
+                total += int(observed[name] or 0)
+            except (TypeError, ValueError):
+                return False, f"{name} is not a count: {observed[name]!r}"
+        if total > 0:
+            return True, ""
+        return False, f"{' + '.join(names)} == 0"
+
+    return check
+
+
+def backend_echo_evidence(
+    declared_field: str, effective_field: str
+) -> Any:
+    """Evidence check: the runtime echoed back the implementation we asked for.
+
+    Frameworks substitute a fallback when an optional backend cannot be
+    imported, so equality here is the only proof the requested one ran.
+    """
+
+    def check(observed: Mapping[str, Any]) -> tuple[bool, str]:
+        declared = observed.get(declared_field)
+        effective = observed.get(effective_field)
+        if not declared:
+            return False, f"no {declared_field} declared"
+        if not effective:
+            return False, f"runtime reported no {effective_field}"
+        if declared != effective:
+            return (
+                False,
+                f"{effective_field}={effective!r} but {declared_field}={declared!r}",
+            )
+        return True, ""
+
+    return check
 
 
 def register_target_kind(kind: TargetKind) -> TargetKind:
@@ -117,6 +175,12 @@ def register_target_kind(kind: TargetKind) -> TargetKind:
             f"observable proof its artifact actually ran. A kind without one "
             f"admits measurements of interventions that never happened "
             f"(see the class docstring)."
+        )
+    if not callable(kind.evidence_check):
+        raise ValueError(
+            f"target kind {kind.name!r} must declare a callable evidence_check "
+            f"so its execution_signal can be evaluated rather than read. A "
+            f"prose-only signal is one nothing enforces."
         )
     _REGISTRY[kind.name] = kind
     return kind
@@ -137,6 +201,7 @@ register_target_kind(
         name=MODULE,
         description="replaces a whole module's forward",
         execution_signal="dispatch.candidate_calls > 0",
+        evidence_check=counter_evidence("candidate_calls"),
     )
 )
 
@@ -149,6 +214,7 @@ register_target_kind(
         ),
         description="rewrites selected nodes inside a captured region",
         execution_signal="dispatch.candidate_calls > 0",
+        evidence_check=counter_evidence("candidate_calls"),
     )
 )
 
@@ -160,6 +226,9 @@ register_target_kind(
         replaces_region=False,
         description="selects an attention backend implementation",
         execution_signal="effective_backend == declared attention_backend",
+        evidence_check=backend_echo_evidence(
+            "attention_backend", "effective_backend"
+        ),
     )
 )
 
@@ -171,6 +240,7 @@ register_target_kind(
         replaces_region=False,
         description="wraps the denoising loop and may skip steps",
         execution_signal="loop_transform.steps_skipped + hook_invocations > 0",
+        evidence_check=counter_evidence("steps_skipped", "hook_invocations"),
     )
 )
 
@@ -259,3 +329,19 @@ def execution_signal_for(kind_name: str) -> str:
     if spec is None:
         raise ValueError(f"unknown target_kind {kind_name!r}")
     return spec.execution_signal
+
+
+def evaluate_execution_signal(
+    kind_name: str, observed: Mapping[str, Any]
+) -> tuple[bool, str]:
+    """Did ``kind_name``'s artifact demonstrably run, given ``observed``?
+
+    Returns ``(ran, reason)``; ``reason`` is empty when it ran and otherwise
+    says what was missing or zero. An unknown kind returns ``False`` rather
+    than raising: a harness that cannot identify the kind has no basis for
+    claiming the arms differed, which is the whole point of the check.
+    """
+    spec = target_kind_spec(kind_name)
+    if spec is None:
+        return False, f"unknown target_kind {kind_name!r}"
+    return spec.evidence_check(observed)

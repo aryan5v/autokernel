@@ -621,16 +621,14 @@ def validate_candidates(
                         "baseline_us": float(primary["pytorch_latency_us"]),
                         "candidate_us": float(primary["kernel_latency_us"]),
                         "speedup": speedup,
-                        # What this isolated speedup is worth on the whole
-                        # model, so a reader never has to reconstruct it from
-                        # a region share and an upper bound again.
-                        "region_share_of_e2e": share,
-                        "measured_e2e_improvement": realized,
-                        "impact_basis": impact_basis,
-                        "projected_end_to_end_speedup": projected,
-                        "min_end_to_end_speedup": min_end_to_end_speedup,
-                        "dispatch_overhead_fraction": dispatch_overhead,
-                        "parity_policy": parity_policy,
+                        # Artifact schema 1 is intentionally strict and its
+                        # benchmark object records isolated harness evidence
+                        # only. Whole-model impact -- region share, realized
+                        # improvement, its basis, the projection and the gate --
+                        # stays authoritative in the search receipt below, which
+                        # has fields for it. Writing it here instead made every
+                        # bundle fail validation on an unknown field, so the
+                        # search produced candidates that could never package.
                         "max_abs_error": max_abs,
                         "max_rel_error": max_rel,
                         "atol": tolerance.atol,
@@ -671,6 +669,17 @@ def validate_candidates(
                         "result": str(result_path),
                         "speedup": speedup,
                         "artifact_id": artifact_id,
+                        # Whole-model impact lives here rather than in the
+                        # bundle's benchmark object, whose schema admits
+                        # isolated harness evidence only. A reader should never
+                        # have to reconstruct this from a share and a bound.
+                        "region_share_of_e2e": share,
+                        "measured_e2e_improvement": realized,
+                        "impact_basis": impact_basis,
+                        "projected_end_to_end_speedup": projected,
+                        "min_end_to_end_speedup": min_end_to_end_speedup,
+                        "dispatch_overhead_fraction": dispatch_overhead,
+                        "parity_policy": parity_policy,
                     },
                 }
             )

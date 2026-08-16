@@ -152,19 +152,14 @@ def _aggregate_region_timing(
     if not profiler_rows:
         return region.cuda_time_us, region.self_cuda_time_us, region.calls
 
-    # A shape-specific record_function range names the region itself. PyTorch
-    # reports its useful device attribution as inclusive CUDA time while its
-    # self CUDA time is normally zero (the range launches no kernel directly).
-    # Treat that inclusive duration as the region's attributed duration. This
-    # is safe per candidate; callers must not sum nested candidate shares.
-    attributed_self = [
-        row.cuda_time_us if row.name == region.name else row.self_cuda_time_us
-        for row in profiler_rows
-    ]
-
-    total_cuda = sum(row.cuda_time_us for row in profiler_rows)
-    total_self_cuda = sum(attributed_self)
-
+    # A shape-specific record_function range names the region itself, and its
+    # inclusive CUDA time is the authoritative duration for the whole region:
+    # every operator row that also matched is a *nested child* of that range,
+    # not additional work beside it. Adding the two inflated Cosmos's
+    # transformer attribution from 275.7s to 485.1s and made a 21.8ms text
+    # encoder range look like 199.5s. When FastVideo emitted the named ranges,
+    # use only those.
+    #
     # ``calls`` means "how many times was this region invoked", because that is
     # what the impact model multiplies a per-call saving by. Summing the call
     # counts of every matched profiler row answers a different question -- how
@@ -172,17 +167,23 @@ def _aggregate_region_timing(
     # orders of magnitude once a region matches more than one row. Run r4
     # reported calls=195661 for transformer.model.transformer_blocks, a region
     # FastVideo's dispatcher observed being invoked 1151 times; the 195661 was
-    # the aten-event count across 48 blocks x 8 steps x 3 generations.
-    #
-    # The record_function range named after the region is one range per
-    # invocation, so it is the authoritative count when present.
+    # the aten-event count across 48 blocks x 8 steps x 3 generations. The
+    # named range is one range per invocation, so it is authoritative here too.
     named_rows = [row for row in profiler_rows if row.name == region.name]
     if named_rows:
+        total_cuda = sum(row.cuda_time_us for row in named_rows)
+        # The range itself launches no kernel, so its self time is normally
+        # zero; the inclusive duration is what the region actually costs.
+        total_self_cuda = total_cuda
         total_calls = sum(row.calls for row in named_rows)
     else:
-        # No range for this region: every matched row saw the region at least
-        # once, so the largest single row bounds the invocation count from
-        # below without inventing launches the region never made.
+        # No range for this region: operator rows are siblings, so exclusive
+        # self time is the only non-double-counting attribution available.
+        total_cuda = sum(row.cuda_time_us for row in profiler_rows)
+        total_self_cuda = sum(row.self_cuda_time_us for row in profiler_rows)
+        # Every matched row saw the region at least once, so the largest single
+        # row bounds the invocation count from below without inventing launches
+        # the region never made.
         total_calls = max(row.calls for row in profiler_rows)
 
     # Fall back to region's own timing if no profiler data

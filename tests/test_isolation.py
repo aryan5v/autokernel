@@ -162,3 +162,73 @@ def test_artifact_ids_are_read_from_bundle_manifests(tmp_path) -> None:
 
 def test_an_empty_artifact_root_is_reported(tmp_path) -> None:
     assert artifact_ids_in(tmp_path) == ()
+
+
+# -- execution signals are per kind -------------------------------------
+#
+# A schedule transform never increments candidate_calls. Asserting the kernel
+# counter for every kind reads "did not run" as "ran" for the kinds that do not
+# touch it, which is how a timing whose intervention never happened gets read
+# as a result (SLURM 1078).
+
+
+def test_a_kernel_trial_still_proves_itself_with_dispatch_calls() -> None:
+    assert _trial(target_kinds=("module",), candidate_calls=14).ran
+    assert not _trial(target_kinds=("module",), candidate_calls=0).ran
+
+
+def test_a_schedule_transform_is_not_judged_by_the_kernel_counter() -> None:
+    # Dispatch calls say nothing about a loop transform either way.
+    never_ran = _trial(
+        target_kinds=("schedule_transform",),
+        candidate_calls=0,
+        execution_evidence={"steps_skipped": 0, "hook_invocations": 0},
+    )
+    assert not never_ran.ran
+    assert "schedule_transform" in never_ran.execution_failures[0]
+
+    ran = _trial(
+        target_kinds=("schedule_transform",),
+        candidate_calls=0,
+        execution_evidence={"steps_skipped": 6, "hook_invocations": 40},
+    )
+    assert ran.ran
+    assert ran.worthwhile
+
+
+def test_a_transform_with_no_reported_evidence_is_not_assumed_to_have_run() -> None:
+    """Absent evidence is not zero and is certainly not proof."""
+    silent = _trial(target_kinds=("schedule_transform",), execution_evidence={})
+    assert not silent.ran
+    assert "no evidence reported" in silent.execution_failures[0]
+
+
+def test_an_attention_trial_needs_the_backend_it_asked_for() -> None:
+    substituted = _trial(
+        target_kinds=("attention",),
+        execution_evidence={
+            "attention_backend": "SAGE_ATTN",
+            "effective_backend": "FLASH_ATTN",
+        },
+    )
+    assert not substituted.ran
+    assert "FLASH_ATTN" in substituted.execution_failures[0]
+
+    honest = _trial(
+        target_kinds=("attention",),
+        execution_evidence={
+            "attention_backend": "SAGE_ATTN",
+            "effective_backend": "SAGE_ATTN",
+        },
+    )
+    assert honest.ran
+
+
+def test_a_mixed_trial_must_satisfy_every_kind_present() -> None:
+    trial = _trial(
+        target_kinds=("module", "schedule_transform"),
+        execution_evidence={"candidate_calls": 14},
+    )
+    assert not trial.ran
+    assert len(trial.execution_failures) == 1
+    assert trial.execution_failures[0].startswith("schedule_transform")

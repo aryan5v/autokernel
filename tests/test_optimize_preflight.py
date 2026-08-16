@@ -676,3 +676,37 @@ def test_every_mismatch_code_is_distinct_and_stable():
 def test_preflight_error_is_an_optimize_error(tmp_path: Path, repo_root: Path):
     with pytest.raises(OptimizeError):
         run_optimize(_config(tmp_path, repo_root, baseline="nope"))
+
+
+# -- the harness is evidence identity ------------------------------------
+#
+# Six gap-7 attempts each edited the harness between runs, so no run measured
+# the same system as the one before it and nothing accumulated. The contract
+# recorded the MotionKernel commit from the start but never compared it.
+
+
+def test_a_changed_harness_commit_fails_a_resume_closed():
+    stored = {"commit": "aaa111", "path_digest": "one"}
+    edited = {"commit": "bbb222", "path_digest": "one"}
+
+    codes = [
+        f.code
+        for f in compare_run_contract(
+            {"motionkernel": stored, "policy": {}, "commands": {}},
+            {"motionkernel": edited, "policy": {}, "commands": {}},
+        )
+    ]
+    assert codes == ["contract_mismatch_harness"]
+
+
+def test_a_moved_harness_checkout_at_the_same_commit_still_resumes():
+    stored = {"commit": "aaa111", "path_digest": "one"}
+    moved = {"commit": "aaa111", "path_digest": "two"}
+
+    assert (
+        compare_run_contract(
+            {"motionkernel": stored, "policy": {}, "commands": {}},
+            {"motionkernel": moved, "policy": {}, "commands": {}},
+        )
+        == []
+    )

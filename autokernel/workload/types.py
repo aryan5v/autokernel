@@ -91,6 +91,7 @@ _FIDELITY_FIELDS = {
 _PERFORMANCE_FIELDS = {
     "min_end_to_end_speedup",
     "max_peak_memory_regression",
+    "profiled_share",
 }
 _MODE_ENV_FIELDS = {
     "native",
@@ -644,10 +645,20 @@ class FidelitySpec:
 
 @dataclass(frozen=True)
 class PerformanceSpec:
-    """Promotion thresholds for end-to-end model-level evaluation."""
+    """Promotion thresholds for end-to-end model-level evaluation.
+
+    ``profiled_share`` is the fraction of device time the optimized component
+    occupies, measured from this workload's own profile. When declared, the
+    speedup gate is derived from its Amdahl ceiling instead of the flat
+    ``min_end_to_end_speedup`` -- see ``autokernel.verification.ceiling``. A
+    flat gate cannot say whether it is unreachable: on ltx-480p attention is
+    15.13% of device time, so no backend can reach a flat 1.3x, and the
+    rejection would say nothing about the candidate.
+    """
 
     min_end_to_end_speedup: float = 1.01
     max_peak_memory_regression: float = 0.05
+    profiled_share: float | None = None
 
     @classmethod
     def from_dict(
@@ -670,13 +681,27 @@ class PerformanceSpec:
                 f"{location}.max_peak_memory_regression",
                 minimum=0.0,
             ),
+            profiled_share=(
+                None
+                if raw.get("profiled_share") is None
+                else _finite_number(
+                    raw.get("profiled_share"),
+                    source,
+                    f"{location}.profiled_share",
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+            ),
         )
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "min_end_to_end_speedup": self.min_end_to_end_speedup,
             "max_peak_memory_regression": self.max_peak_memory_regression,
         }
+        if self.profiled_share is not None:
+            payload["profiled_share"] = self.profiled_share
+        return payload
 
 
 @dataclass(frozen=True)

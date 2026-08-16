@@ -725,6 +725,7 @@ CONTRACT_MISMATCH_CODES: dict[str, str] = {
     "artifact_dir_name": "contract_mismatch_artifact_dir",
     "stage_commands": "contract_mismatch_stage_commands",
     "search_agent": "contract_mismatch_search_agent_command",
+    "motionkernel": "contract_mismatch_harness",
 }
 
 
@@ -783,6 +784,23 @@ def compare_run_contract(
     ):
         if stored_policy.get(key) != current_policy.get(key):
             mismatch(key, stored_policy.get(key), current_policy.get(key))
+
+    # The harness is evidence identity, not an invocation control. Editing
+    # bench, verification or measurement code between runs of one campaign
+    # invalidates whatever ran before it: a resumed campaign would mix results
+    # produced by two different harnesses under one verdict. This was recorded
+    # in the contract from the start but never compared, so six gap-7 attempts
+    # each re-ran against a harness the previous attempt had not used.
+    if not _checkout_matches(
+        stored.get("motionkernel") or {}, current.get("motionkernel") or {}
+    ):
+        stored_mk = stored.get("motionkernel") or {}
+        current_mk = current.get("motionkernel") or {}
+        mismatch(
+            "motionkernel",
+            stored_mk.get("commit") or stored_mk.get("path_digest"),
+            current_mk.get("commit") or current_mk.get("path_digest"),
+        )
 
     stored_commands = stored.get("commands") or {}
     current_commands = current.get("commands") or {}

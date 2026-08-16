@@ -53,6 +53,8 @@ __all__ = [
     "amdahl_ceiling",
     "derive_gate",
     "evaluate_gate",
+    "gate_basis_for_workload",
+    "gate_from_workload",
 ]
 
 #: Never promote for less than this, however low the ceiling.
@@ -178,11 +180,54 @@ def gate_from_workload(workload: Any, *, share: float | None = None) -> float:
     is unreachable.
     """
     performance = getattr(workload, "performance", None)
+    if share is None:
+        share = getattr(performance, "profiled_share", None)
     if share is not None:
-        return derive_gate(amdahl_ceiling(share))
+        return derive_gate(amdahl_ceiling(float(share)))
     declared = getattr(performance, "min_end_to_end_speedup", None)
     if declared is None:
         raise CeilingError(
             "workload declares neither a profiled share nor a flat gate"
         )
     return float(declared)
+
+
+def gate_basis_for_workload(
+    workload: Any, *, share: float | None = None
+) -> dict[str, Any]:
+    """The gate and how it was derived, for the record a verdict carries.
+
+    A stored decision has to stay interpretable after the rule changes, so the
+    basis travels with the number: the share it came from, the ceiling that
+    share implies, the rule, and whether the gate is flat -- which is the case
+    a reader should distrust, because a flat gate cannot say whether it was
+    reachable.
+    """
+    performance = getattr(workload, "performance", None)
+    if share is None:
+        share = getattr(performance, "profiled_share", None)
+    if share is not None:
+        ceiling = amdahl_ceiling(float(share))
+        return {
+            "gate": derive_gate(ceiling),
+            "basis": "ceiling",
+            "profiled_share": float(share),
+            "ceiling": ceiling,
+            "rule": CEILING_GATE_RULE,
+        }
+    declared = getattr(performance, "min_end_to_end_speedup", None)
+    if declared is None:
+        raise CeilingError(
+            "workload declares neither a profiled share nor a flat gate"
+        )
+    return {
+        "gate": float(declared),
+        "basis": "flat",
+        "profiled_share": None,
+        "ceiling": None,
+        "rule": "declared min_end_to_end_speedup",
+        "deprecation": (
+            "flat gate: declare performance.profiled_share so the gate can be "
+            "derived from the workload's Amdahl ceiling"
+        ),
+    }

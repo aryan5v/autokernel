@@ -22,6 +22,7 @@ from autokernel.artifact.kinds import (
     MODULE,
     SUBGRAPH,
     TargetKind,
+    counter_evidence,
     known_target_kinds,
     register_target_kind,
     target_kind_spec,
@@ -112,8 +113,11 @@ def test_a_new_kind_can_be_registered_without_touching_validation() -> None:
             required=frozenset({"threshold"}),
             replaces_region=False,
             description="a test kind",
-            # Required of every kind: how a harness would know it ran.
+            # Required of every kind: how a harness would know it ran, and
+            # the evaluable form of it -- a signal nothing can check is how a
+            # measurement of an intervention that never ran passed every gate.
             execution_signal="test_only.invocations > 0",
+            evidence_check=counter_evidence("invocations"),
         )
     )
     spec = validate_kind_fields("test_only_kind", {"threshold": 0.4})

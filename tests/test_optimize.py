@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -365,3 +366,49 @@ def test_stop_after_stage_rejects_unknown_stage(
 
     with pytest.raises(OptimizeError, match="stop_after_stage"):
         run_optimize(config)
+
+
+# -- the benchmark object a search writes must actually validate ---------
+#
+# search.py once wrote whole-model impact fields into the bundle's benchmark
+# object. Artifact schema 1 admits isolated harness evidence only, so
+# _unknown_fields rejected every bundle: the search produced candidates that
+# could never package, and the campaign died at the packaging stage with a
+# message about an unknown field rather than anything about the kernel.
+
+
+def test_the_benchmark_fields_search_writes_are_the_ones_the_schema_admits() -> None:
+    import inspect
+
+    from autokernel.artifact.types import _BENCHMARK_FIELDS
+    from autokernel.optimize import search as search_module
+
+    source = inspect.getsource(search_module.validate_candidates)
+    start = source.index('"benchmark": {')
+    end = source.index('"generation": {', start)
+    written = set(re.findall(r'"([a-z_]+)":', source[start:end]))
+    written.discard("benchmark")
+
+    unknown = written - set(_BENCHMARK_FIELDS)
+    assert not unknown, (
+        f"validate_candidates writes benchmark fields the artifact schema "
+        f"rejects: {sorted(unknown)}. Every bundle would fail validation."
+    )
+
+
+def test_whole_model_impact_survives_in_the_validation_receipt() -> None:
+    """Removing those fields from the bundle must not lose the evidence."""
+    import inspect
+
+    from autokernel.optimize import search as search_module
+
+    source = inspect.getsource(search_module.validate_candidates)
+    start = source.index('"validation": {')
+    receipt = source[start : source.index("}", source.index("parity_policy", start))]
+    for field in (
+        "region_share_of_e2e",
+        "measured_e2e_improvement",
+        "impact_basis",
+        "projected_end_to_end_speedup",
+    ):
+        assert field in receipt, f"{field} lost when it left the benchmark object"
