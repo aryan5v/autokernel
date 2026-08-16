@@ -116,6 +116,23 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     result.add_argument(
+        "--search-agent",
+        default="codex",
+        help=(
+            "Named search-agent preset: codex (sandboxes its own writes) or "
+            "pi (multi-provider; requires --search-model). Ignored when "
+            "--search-agent-command is given."
+        ),
+    )
+    result.add_argument(
+        "--search-model",
+        default=None,
+        help=(
+            "Model for the search agent, e.g. anthropic/claude-sonnet-4-5. "
+            "Required by presets that serve several providers."
+        ),
+    )
+    result.add_argument(
         "--preflight-only",
         action="store_true",
         help=(
@@ -162,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
             per_candidate_budget_seconds=args.per_candidate_budget_seconds,
             stage_commands=_load_stage_commands(args.stage_commands),
             search_agent_command=_load_argv(args.search_agent_command),
+            search_agent=args.search_agent,
+            search_model=args.search_model,
             repo_root=repo_root,
             stop_after_stage=args.stop_after_stage,
         )

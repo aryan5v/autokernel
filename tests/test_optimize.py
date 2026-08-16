@@ -412,3 +412,59 @@ def test_whole_model_impact_survives_in_the_validation_receipt() -> None:
         "projected_end_to_end_speedup",
     ):
         assert field in receipt, f"{field} lost when it left the benchmark object"
+
+
+# -- search agents are a preset, not a vendor ----------------------------
+
+
+def test_the_pi_preset_requires_a_model_because_it_serves_many_providers(
+    tmp_path: Path,
+) -> None:
+    from autokernel.optimize.search import BuiltinSearchError, _agent_command
+
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("optimize this", encoding="utf-8")
+    with pytest.raises(BuiltinSearchError, match="needs a model"):
+        _agent_command(
+            None,
+            repo_root=tmp_path,
+            run_dir=tmp_path,
+            candidate_dir=tmp_path,
+            prompt_path=prompt,
+            last_message=tmp_path / "last.md",
+            agent="pi",
+        )
+
+
+def test_an_unknown_agent_names_the_presets_it_knows(tmp_path: Path) -> None:
+    from autokernel.optimize.search import BuiltinSearchError, agent_preset
+
+    with pytest.raises(BuiltinSearchError, match="codex, pi"):
+        agent_preset("nonexistent-agent")
+
+
+def test_only_codex_claims_to_confine_its_own_writes() -> None:
+    """pi ships no permission system, so the harness digest check is not optional."""
+    from autokernel.optimize.search import AGENT_PRESETS
+
+    assert AGENT_PRESETS["codex"]["sandboxed"] is True
+    assert AGENT_PRESETS["pi"]["sandboxed"] is False
+
+
+def test_the_harness_digest_notices_an_edited_verification_module(
+    tmp_path: Path,
+) -> None:
+    from autokernel.optimize.search import _harness_digest
+
+    repo = tmp_path / "repo"
+    (repo / "autokernel" / "verification").mkdir(parents=True)
+    (repo / "autokernel" / "specs").mkdir(parents=True)
+    (repo / "bench.py").write_text("original\n", encoding="utf-8")
+    policy = repo / "autokernel" / "verification" / "policy.py"
+    policy.write_text("atol = 1e-6\n", encoding="utf-8")
+
+    before = _harness_digest(repo)
+    assert _harness_digest(repo) == before
+
+    policy.write_text("atol = 1e-1\n", encoding="utf-8")
+    assert _harness_digest(repo) != before

@@ -72,6 +72,9 @@ performance:
   # kernel artifacts: a whole-backend swap that only clears 1.01x is not worth
   # the fidelity cost it charges.
   min_end_to_end_speedup: 1.3
+  # See wan_t2v_1.3b_480p_attention.yaml: same workload, same measured
+  # attention share, so the same ceiling-derived gate applies.
+  profiled_share: 0.2717
   max_peak_memory_regression: 0.05
 mode_env:
   native:

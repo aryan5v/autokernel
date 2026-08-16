@@ -93,6 +93,11 @@ class OptimizeConfig:
     # expanded without a shell; when omitted, the built-in adapter uses the
     # installed Codex CLI.
     search_agent_command: Sequence[str] | None = None
+    # Named agent preset (see search.AGENT_PRESETS) used when no explicit
+    # command is given, and the model it should run. The model is a campaign
+    # parameter because a multi-provider agent has no single honest default.
+    search_agent: str = "codex"
+    search_model: str | None = None
     repo_root: Path | None = None
     # Stop after this pipeline stage completes instead of running to
     # finalize. Must be one of PIPELINE_STAGES. An operational control, not
@@ -122,6 +127,8 @@ class OptimizeConfig:
                 if self.search_agent_command
                 else None
             ),
+            "search_agent": self.search_agent,
+            "search_model": self.search_model,
             "repo_root": str(self.repo_root) if self.repo_root else None,
             "stop_after_stage": self.stop_after_stage,
         }

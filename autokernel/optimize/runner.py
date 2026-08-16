@@ -245,6 +245,25 @@ def run_optimize(
             raise OptimizeError("stored campaign config must be a JSON object")
         _validate_resume_config(stored_config, config)
         state = load_state(layout["state"])
+        status = state.get("status")
+        if status in {"failed", "budget_exhausted"}:
+            # --resume is specifically the recovery path for an interrupted or
+            # repaired campaign. A previous failure receipt is not permanently
+            # terminal: preserve every durable, successful stage and reopen the
+            # first incomplete one, rather than replaying the old receipt and
+            # discarding hours of GPU work because one stage died.
+            failed_stages = dict(state.get("failed_stages") or {})
+            state["failed_stages"] = {
+                stage: message
+                for stage, message in failed_stages.items()
+                if stage_is_complete(state, stage)
+            }
+            state["status"] = "running"
+            state["terminal"] = None
+            state.setdefault("messages", []).append(
+                {"at": utc_now(), "text": f"resumed after terminal status {status}"}
+            )
+            save_state(layout["state"], state)
         if state.get("status") in TERMINAL_STATUSES:
             # A discovery-only stop is terminal for the *same* requested stop
             # stage, so a nightly rerun is idempotent. Resuming with a later

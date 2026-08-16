@@ -64,6 +64,14 @@ performance:
   # kernel artifacts: a whole-backend swap that only clears 1.01x is not worth
   # the fidelity cost it charges.
   min_end_to_end_speedup: 1.3
+  # Attention's measured share of device time on this workload (scripts/
+  # attention_share.py, round 2 step 1: 27-35%; the conservative end is used
+  # here). The gate is derived from its Amdahl ceiling -- 1.373x at this share,
+  # so a candidate must reach ~1.19x, about half the headroom that exists --
+  # rather than from the flat 1.3x above, which is retained only as the
+  # fallback for readers of older schemas. A flat gate cannot say whether it
+  # is reachable; this one can.
+  profiled_share: 0.2717
   max_peak_memory_regression: 0.05
 mode_env:
   native:

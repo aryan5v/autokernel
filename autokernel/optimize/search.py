@@ -269,6 +269,60 @@ version and say so in the final message.
 """
 
 
+#: Agent presets. The search interface is an argv list, so any CLI agent works
+#: through --search-agent-command; these are the ones we keep working.
+#:
+#: ``sandboxed`` records whether the agent confines its own writes. Codex does
+#: (``-s workspace-write``). Pi ships no permission system and inherits the
+#: user's, so a pi search is only as bounded as the process around it -- which
+#: is why the search stage verifies afterwards that the harness tree is
+#: untouched rather than trusting the agent to have stayed inside its
+#: candidate directory.
+AGENT_PRESETS: dict[str, dict[str, Any]] = {
+    "codex": {
+        "program": "codex",
+        "sandboxed": True,
+        "argv": [
+            "exec",
+            "-C",
+            "{candidate_dir}",
+            "-s",
+            "workspace-write",
+            "--skip-git-repo-check",
+            "--output-last-message",
+            "{last_message}",
+            "{prompt}",
+        ],
+    },
+    # pi (github.com/earendil-works/pi): multi-provider, so the model is a
+    # campaign parameter rather than a property of the installed CLI.
+    "pi": {
+        "program": "pi",
+        "sandboxed": False,
+        "argv": [
+            "--print",
+            "--no-session",
+            "--model",
+            "{model}",
+            "{prompt}",
+        ],
+    },
+}
+
+DEFAULT_AGENT = "codex"
+
+
+def agent_preset(name: str) -> dict[str, Any]:
+    preset = AGENT_PRESETS.get(name)
+    if preset is None:
+        known = ", ".join(sorted(AGENT_PRESETS))
+        raise BuiltinSearchError(
+            f"unknown search agent {name!r}; known presets: {known}. Any other "
+            f"CLI agent can be used through --search-agent-command."
+        )
+    return preset
+
+
 def _agent_command(
     configured: Sequence[str] | None,
     *,
@@ -277,6 +331,8 @@ def _agent_command(
     candidate_dir: Path,
     prompt_path: Path,
     last_message: Path,
+    agent: str = DEFAULT_AGENT,
+    model: str | None = None,
 ) -> list[str]:
     replacements = {
         "{repo_root}": str(repo_root),
@@ -284,34 +340,59 @@ def _agent_command(
         "{candidate_dir}": str(candidate_dir),
         "{prompt_file}": str(prompt_path),
         "{last_message}": str(last_message),
+        "{prompt}": prompt_path.read_text(encoding="utf-8"),
+        "{model}": str(model or ""),
     }
-    if configured:
+
+    def expand(parts: Sequence[str]) -> list[str]:
         command = []
-        for raw in configured:
+        for raw in parts:
             value = str(raw)
             for placeholder, replacement in replacements.items():
                 value = value.replace(placeholder, replacement)
             command.append(value)
         return command
 
-    executable = shutil.which("codex")
+    if configured:
+        return expand(configured)
+
+    preset = agent_preset(agent)
+    if model is None and preset.get("default_model"):
+        replacements["{model}"] = str(preset["default_model"])
+    if "{model}" in "".join(preset["argv"]) and not replacements["{model}"]:
+        raise BuiltinSearchError(
+            f"search agent {agent!r} needs a model; pass --search-model "
+            f"(it serves several providers, so there is no single default that "
+            f"is honest about cost or capability)"
+        )
+    executable = shutil.which(preset["program"])
     if executable is None:
         raise BuiltinSearchError(
-            "autonomous search requires the Codex CLI or "
-            "--search-agent-command"
+            f"autonomous search requires the {preset['program']!r} CLI on PATH "
+            f"or an explicit --search-agent-command"
         )
-    return [
-        executable,
-        "exec",
-        "-C",
-        str(candidate_dir),
-        "-s",
-        "workspace-write",
-        "--skip-git-repo-check",
-        "--output-last-message",
-        str(last_message),
-        prompt_path.read_text(encoding="utf-8"),
-    ]
+    return [executable, *expand(preset["argv"])]
+
+
+def _harness_digest(repo_root: Path) -> str:
+    """A digest of the fixed harness the search must not touch.
+
+    Only the files whose contents decide a verdict: the benchmark, the
+    verification package, and the specs. A search that edits any of them has
+    changed what "passing" means, and its result is not evidence about a
+    kernel.
+    """
+    digest = hashlib.sha256()
+    targets: list[Path] = [repo_root / "bench.py"]
+    for directory in ("autokernel/verification", "autokernel/specs"):
+        targets.extend(sorted((repo_root / directory).rglob("*.py")))
+    for path in targets:
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"<unreadable>")
+        digest.update(str(path.relative_to(repo_root)).encode())
+    return digest.hexdigest()
 
 
 def search_candidates(
@@ -326,6 +407,14 @@ def search_candidates(
     configured = config.get("search_agent_command")
     if configured is not None and not isinstance(configured, list):
         raise BuiltinSearchError("search_agent_command must be an argv list")
+    agent = str(config.get("search_agent") or DEFAULT_AGENT)
+    search_model = config.get("search_model")
+    search_model = str(search_model) if search_model else None
+    # An agent that does not confine its own writes gets checked instead of
+    # trusted: the harness, specs and corpora sit outside the candidate
+    # directory and must be byte-identical after the agent exits.
+    sandboxed = bool(configured) or bool(agent_preset(agent).get("sandboxed"))
+    harness_before = None if sandboxed else _harness_digest(repo_root)
     budget_value = config.get("per_candidate_budget_seconds")
     per_candidate_budget = (
         float(budget_value) if budget_value is not None else None
@@ -370,6 +459,8 @@ def search_candidates(
                 candidate_dir=generated["kernel"].parent,
                 prompt_path=prompt_path,
                 last_message=last_message,
+                agent=agent,
+                model=search_model,
             )
             try:
                 completed = subprocess.run(
@@ -449,6 +540,16 @@ def search_candidates(
         except BuiltinSearchError as exc:
             failures.append({"fingerprint": fingerprint, "reason": str(exc)})
 
+    if harness_before is not None and _harness_digest(repo_root) != harness_before:
+        # Not a warning. Every measurement this stage produced was taken
+        # against a harness the agent had modified, so none of them says
+        # anything about a kernel.
+        raise BuiltinSearchError(
+            "the search agent modified the fixed harness (bench.py, "
+            "autokernel/verification or autokernel/specs). Every result from "
+            "this stage is void. Run an agent that confines its own writes, or "
+            "run this one inside a container."
+        )
     if not searched and not measured_count and failures:
         summary = "; ".join(item["reason"] for item in failures[:3])
         raise BuiltinSearchError(f"autonomous search produced no measurement: {summary}")
@@ -458,7 +559,11 @@ def search_candidates(
             "failures": failures,
             "recommendation": "no_worthwhile_candidate",
         }
-    return {"candidates": searched, "failures": failures}
+    return {
+        "candidates": searched,
+        "failures": failures,
+        "search_agent": {"agent": agent, "model": search_model, "sandboxed": sandboxed},
+    }
 
 
 def _gpu_architecture(payload: Mapping[str, Any]) -> str:

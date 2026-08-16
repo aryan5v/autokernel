@@ -617,17 +617,64 @@ def _check_search_agent(
         record["resolved"] = Path(resolved).name
         return record
 
-    resolved = shutil.which("codex")
+    from .search import AGENT_PRESETS
+
+    agent = getattr(config, "search_agent", "codex") or "codex"
+    preset = AGENT_PRESETS.get(agent)
+    if preset is None:
+        report.error(
+            "search_agent_unknown",
+            (
+                f"unknown search agent {agent!r}; known presets: "
+                f"{', '.join(sorted(AGENT_PRESETS))}"
+            ),
+            program=agent,
+        )
+        return record
+    record["agent"] = agent
+    record["sandboxed"] = bool(preset.get("sandboxed"))
+
+    model = getattr(config, "search_model", None) or preset.get("default_model")
+    if "{model}" in "".join(preset["argv"]) and not model:
+        report.error(
+            "search_model_missing",
+            (
+                f"search agent {agent!r} serves several providers and has no "
+                f"honest default; pass --search-model"
+            ),
+            program=agent,
+        )
+        return record
+    if model:
+        record["model"] = str(model)
+
+    program = str(preset["program"])
+    resolved = shutil.which(program)
     if resolved is None:
         report.error(
             "search_agent_missing",
             (
-                "autonomous search requires the Codex CLI on PATH or an "
-                "explicit --search-agent-command"
+                f"autonomous search requires the {program!r} CLI on PATH or an "
+                f"explicit --search-agent-command"
             ),
-            program="codex",
+            program=program,
         )
         return record
+    if not preset.get("sandboxed"):
+        # Not fatal, but it changes what the search stage is trusting: this
+        # agent does not confine its own writes, so the harness digest check
+        # in the search stage is the only thing keeping the fixed harness
+        # fixed. Recorded so a reader of preflight.json knows which regime the
+        # campaign ran under.
+        report.warn(
+            "search_agent_unsandboxed",
+            (
+                f"{program!r} does not confine its own writes; the search "
+                f"stage will verify the harness is untouched instead. Prefer "
+                f"running it inside a container."
+            ),
+            program=program,
+        )
     record["resolved"] = Path(resolved).name
     return record
 
