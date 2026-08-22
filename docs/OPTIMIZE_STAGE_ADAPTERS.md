@@ -189,6 +189,11 @@ The stage result reports the finalized bundle paths and every decision:
 - Autonomous search still requires an installed, authenticated coding-agent
   CLI (Codex by default) on the GPU worker. The fixed harness and validation
   gates are agent-independent.
+- Candidate `kernel.py` files cannot create CUDA graphs, create/switch CUDA
+  streams, or otherwise own the embedding execution context. The harness
+  rejects those APIs before import. Both search and isolated validation run a
+  dispatch-stress gate over multiple fresh input identities and repeated calls;
+  correctness and speedup must hold in both the fresh and steady phases.
 - The profile adapter currently assumes a single profiler export path. A
   multi-rank workload needs a future aggregation contract for rank-suffixed
   exports before discovery can rank the complete workload.

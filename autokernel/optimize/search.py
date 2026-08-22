@@ -154,6 +154,7 @@ def _benchmark_command(
         # workload never agreed to.
         "--parity-policy",
         parity_policy,
+        "--dispatch-stress",
         "--result-json",
         str(result_path),
     ]
@@ -232,6 +233,32 @@ def _primary(payload: Mapping[str, Any]) -> dict[str, Any]:
     return primary
 
 
+def _dispatch_stress(payload: Mapping[str, Any]) -> dict[str, Any]:
+    performance = payload.get("performance")
+    stress = (
+        performance.get("dispatch_stress")
+        if isinstance(performance, Mapping)
+        else None
+    )
+    if not isinstance(stress, dict):
+        raise BuiltinSearchError("benchmark produced no dispatch-stress evidence")
+    if stress.get("status") != "PASS" or stress.get("correctness") != "PASS":
+        raise BuiltinSearchError(
+            "candidate failed repeated-dispatch validation: "
+            f"{stress.get('reason') or 'unknown reason'}"
+        )
+    for name in ("fresh_input_speedup", "steady_input_speedup"):
+        value = stress.get(name)
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise BuiltinSearchError(f"dispatch stress {name} is missing")
+        number = float(value)
+        if not math.isfinite(number) or number <= 1.0:
+            raise BuiltinSearchError(
+                f"dispatch stress {name} must be greater than 1.0"
+            )
+    return stress
+
+
 def _agent_prompt(
     candidate: Mapping[str, Any],
     generated: Mapping[str, Path],
@@ -263,9 +290,13 @@ You may change only kernel.py in the candidate directory. Never edit the
 manifest, spec, corpus, benchmark harness, references, tolerances, or verifier.
 Keep only changes that pass correctness and improve speedup_vs_pytorch. Explore
 Triton, torch.compile, and fused PyTorch implementations as appropriate for the
-captured operations and observed shapes. Leave the fastest passing candidate in
-kernel.py. If no implementation beats the reference, restore the best passing
-version and say so in the final message.
+captured operations and observed shapes. Do not create or capture CUDA graphs,
+and do not create or switch CUDA streams: FastVideo owns the execution context
+and may apply framework-level graph replay after validation. The benchmark's
+dispatch-stress gate uses several fresh tensor identities and repeated calls;
+both its fresh and steady speedups must exceed 1.0x. Leave the fastest passing
+candidate in kernel.py. If no implementation beats the reference, restore the
+best passing version and say so in the final message.
 """
 
 
@@ -511,6 +542,7 @@ def search_candidates(
             )
             measured_count += 1
             primary = _primary(payload)
+            stress = _dispatch_stress(payload)
             forward = payload.get("forward")
             correct = (
                 isinstance(forward, Mapping)
@@ -532,6 +564,12 @@ def search_candidates(
                         "kernel": str(generated["kernel"]),
                         "result": str(quick_result),
                         "speedup": speedup,
+                        "fresh_dispatch_speedup": float(
+                            stress["fresh_input_speedup"]
+                        ),
+                        "steady_dispatch_speedup": float(
+                            stress["steady_input_speedup"]
+                        ),
                         "agent_log": str(log_path),
                         "agent_summary": str(last_message),
                     },
@@ -652,6 +690,7 @@ def validate_candidates(
             if not isinstance(forward, Mapping) or forward.get("correctness") != "PASS":
                 raise BuiltinSearchError("candidate failed full isolated correctness")
             primary = _primary(payload)
+            stress = _dispatch_stress(payload)
             speedup = float(primary["speedup_vs_pytorch"])
             if speedup <= 1.0:
                 raise BuiltinSearchError("candidate did not beat the isolated reference")
@@ -773,6 +812,12 @@ def validate_candidates(
                     "validation": {
                         "result": str(result_path),
                         "speedup": speedup,
+                        "fresh_dispatch_speedup": float(
+                            stress["fresh_input_speedup"]
+                        ),
+                        "steady_dispatch_speedup": float(
+                            stress["steady_input_speedup"]
+                        ),
                         "artifact_id": artifact_id,
                         # Whole-model impact lives here rather than in the
                         # bundle's benchmark object, whose schema admits

@@ -2,6 +2,11 @@
 
 ## Unreleased (downstream)
 
+- Candidate kernels may no longer create CUDA graphs or manage CUDA streams;
+  the fixed harness rejects those APIs before importing `kernel.py`. Built-in
+  search and independent validation also require a dispatch-stress measurement
+  across fresh tensor identities and repeated calls, preventing a one-pointer
+  microbenchmark cache from being mistaken for a deployable model speedup.
 - Allow the default autonomous Codex search to enter its intentionally
   isolated, non-Git candidate workspace while preserving workspace-write
   sandboxing.

@@ -21,6 +21,10 @@ from .backward import (
     GradientRecord,
     check_backward,
 )
+from .candidate_policy import (
+    CandidatePolicyViolation,
+    find_execution_context_violations,
+)
 from .compile import CompileCaseRecord, CompileReport, check_compile
 from .corpus import (
     CORPUS_SCHEMA_VERSION,
@@ -30,17 +34,6 @@ from .corpus import (
     load_shape_corpus,
     validate_corpus_against_spec,
     weighted_aggregate,
-)
-from .outputs import (
-    DEFAULT_TOLERANCE,
-    LeafRecord,
-    OutputTreeError,
-    TreeComparison,
-    compare_deterministic,
-    compare_output_trees,
-    compare_tensor_leaf,
-    flatten_output_tree,
-    tree_has_nan_or_inf,
 )
 from .fidelity import (
     ADVISORY,
@@ -55,6 +48,17 @@ from .fidelity import (
     PerceptualEvidence,
     evaluate_fidelity,
     tier_number,
+)
+from .outputs import (
+    DEFAULT_TOLERANCE,
+    LeafRecord,
+    OutputTreeError,
+    TreeComparison,
+    compare_deterministic,
+    compare_output_trees,
+    compare_tensor_leaf,
+    flatten_output_tree,
+    tree_has_nan_or_inf,
 )
 from .perceptual import (
     FrameSet,
@@ -92,6 +96,7 @@ __all__ = [
     "RESULT_SCHEMA_VERSION",
     "TIER_NUMBERS",
     "BackwardReport",
+    "CandidatePolicyViolation",
     "CompileCaseRecord",
     "CompileReport",
     "CorpusCase",
@@ -120,6 +125,7 @@ __all__ = [
     "compare_tensor_leaf",
     "detect_approximate_math",
     "evaluate_fidelity",
+    "find_execution_context_violations",
     "flatten_output_tree",
     "load_shape_corpus",
     "resolve_leaf_tolerance",

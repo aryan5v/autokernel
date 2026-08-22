@@ -344,6 +344,7 @@ def test_ltx_workload_policy_reaches_the_benchmark_command() -> None:
     )
     assert "--parity-policy" in command
     assert command[command.index("--parity-policy") + 1] == "byte_equal"
+    assert "--dispatch-stress" in command
 
 
 def test_absent_workload_falls_back_to_the_strictest_policy() -> None:

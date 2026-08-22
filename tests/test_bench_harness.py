@@ -375,3 +375,49 @@ def test_performance_corpus_only_skips_builtin_sizes(cpu_device, stub_timer):
     )
     labels = [entry["label"] for entry in perf["all"]]
     assert labels == ["prod-a", "prod-b"]
+
+
+def test_dispatch_stress_requires_fresh_and_steady_speedups(
+    cpu_device, monkeypatch: pytest.MonkeyPatch
+):
+    samples = iter((4.0, 5.0, 2.0, 3.0))
+    monkeypatch.setattr(bench, "_time_call_sequence", lambda calls: next(samples))
+
+    result = bench.run_dispatch_stress(
+        _good_kernel,
+        _spec(),
+        size_map={"rows": 8, "cols": 16},
+        dtype=resolve_torch_dtype("float32"),
+        baseline="eager",
+        variants=3,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["correctness"] == "PASS"
+    assert result["fresh_input_speedup"] == pytest.approx(2.0)
+    assert result["steady_input_speedup"] == pytest.approx(4.0 / 3.0)
+
+
+def test_dispatch_stress_rejects_state_carried_between_input_identities(
+    cpu_device,
+):
+    cached = None
+
+    def stale_kernel(x, y):
+        nonlocal cached
+        if cached is None:
+            cached = x + y
+        return cached
+
+    result = bench.run_dispatch_stress(
+        stale_kernel,
+        _spec(),
+        size_map={"rows": 8, "cols": 16},
+        dtype=resolve_torch_dtype("float32"),
+        baseline="eager",
+        variants=3,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["correctness"] == "FAIL"
+    assert "fresh-input variant" in result["reason"]

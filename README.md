@@ -485,7 +485,12 @@ artifact finalization. Search uses the installed Codex CLI by default; pass
 `--search-agent-command agent.json` to use another agent argv without a shell.
 The JSON array supports `{repo_root}`, `{run_dir}`, `{candidate_dir}`,
 `{prompt_file}`, and `{last_message}` placeholders. The fixed validator—not the
-search agent—derives benchmark evidence and package inputs. See
+search agent—derives benchmark evidence and package inputs. Candidate code owns
+the fused computation but not the execution context: CUDA graph capture and
+CUDA stream management remain framework responsibilities and are rejected
+before candidate import. Search and isolated validation additionally exercise
+fresh tensor identities followed by repeated calls, and require the candidate
+to beat the configured baseline in both cases. See
 [`docs/OPTIMIZE_STAGE_ADAPTERS.md`](docs/OPTIMIZE_STAGE_ADAPTERS.md) for the
 contract. The control plane writes `preflight.json`, `run_contract.json`,
 `state.json`, per-stage inputs/results/logs, command receipts, `receipt.json`,

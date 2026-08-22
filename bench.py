@@ -61,6 +61,7 @@ from autokernel.verification import (  # noqa: E402
     collect_environment_metadata,
     compare_deterministic,
     compare_output_trees,
+    find_execution_context_violations,
     result_envelope,
     tree_has_nan_or_inf,
     write_result_atomic,
@@ -360,6 +361,25 @@ def load_candidate_module(directory: str | None = None):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def validate_candidate_execution_policy(directory: str | None = None) -> None:
+    """Reject candidate-owned CUDA graph or stream management before import."""
+
+    root = os.path.abspath(directory or os.getcwd())
+    candidate_path = os.path.join(root, "kernel.py")
+    with open(candidate_path, "r", encoding="utf-8", errors="replace") as handle:
+        source = handle.read()
+    violations = find_execution_context_violations(source)
+    if not violations:
+        return
+    details = ", ".join(
+        f"{item.api} at {item.line}:{item.column}" for item in violations
+    )
+    raise RuntimeError(
+        "candidate execution-context policy violation: CUDA graphs and CUDA "
+        "streams are owned by the embedding runtime, not kernel.py; " + details
+    )
 
 
 def _get_spec_or_exit(registry: KernelRegistry, kernel_type: str) -> KernelSpec:
@@ -903,11 +923,125 @@ def _reference_benchmark_callable(
     return compiled_reference
 
 
+def _time_call_sequence(callables: Sequence[Callable[[], Any]]) -> float:
+    """Return total sequence latency in milliseconds, including every call."""
+
+    if BENCH_DEVICE.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for call in callables:
+            call()
+        end.record()
+        end.synchronize()
+        return float(start.elapsed_time(end))
+    started = time.perf_counter()
+    for call in callables:
+        call()
+    return (time.perf_counter() - started) * 1000.0
+
+
+def run_dispatch_stress(
+    kernel_fn: Callable,
+    spec: KernelSpec,
+    *,
+    size_map: Mapping[str, int],
+    dtype: torch.dtype,
+    baseline: str,
+    variants: int = 4,
+) -> dict[str, Any]:
+    """Exercise fresh tensor identities like repeated model-block dispatch.
+
+    Ordinary microbenchmarks reuse one input dictionary for hundreds of calls.
+    That rewards candidates which cache a single pointer set, even though a
+    repeated transformer stack supplies different activations and parameters.
+    This gate checks an interleaved correctness bank, then times a separate bank
+    on first use and steady reuse. First-use work is deliberately measured.
+    """
+
+    if variants < 2:
+        raise ValueError("dispatch stress requires at least two variants")
+    gen_fn = spec.input_generator
+    ref_fn = _spec_reference(spec)
+
+    correctness_inputs = [
+        gen_fn(dict(size_map), dtype, BENCH_DEVICE, seed=9100 + index)
+        for index in range(variants)
+    ]
+    try:
+        for index in (*range(variants), *range(variants - 1, -1, -1)):
+            inputs = correctness_inputs[index]
+            actual = kernel_fn(**inputs)
+            expected = ref_fn(inputs)
+            comparison = _compare_outputs(actual, expected, spec)
+            if not comparison.match:
+                return {
+                    "status": "FAIL",
+                    "correctness": "FAIL",
+                    "variants": variants,
+                    "reason": (
+                        f"fresh-input variant {index} failed: "
+                        f"{comparison.reason}"
+                    ),
+                }
+    finally:
+        del correctness_inputs
+
+    timing_inputs = [
+        gen_fn(dict(size_map), dtype, BENCH_DEVICE, seed=9200 + index)
+        for index in range(variants)
+    ]
+    candidate_calls = [
+        (lambda inputs=inputs: kernel_fn(**inputs)) for inputs in timing_inputs
+    ]
+    reference_calls = [
+        _reference_benchmark_callable(
+            ref_fn,
+            inputs,
+            baseline=baseline,
+            device=BENCH_DEVICE,
+        )
+        for inputs in timing_inputs
+    ]
+    try:
+        reference_samples = [
+            _time_call_sequence(reference_calls),
+            _time_call_sequence(tuple(reversed(reference_calls))),
+        ]
+        reference_ms = min(reference_samples)
+        fresh_ms = _time_call_sequence(candidate_calls)
+        steady_ms = _time_call_sequence(tuple(reversed(candidate_calls)))
+    finally:
+        del timing_inputs, candidate_calls, reference_calls
+
+    fresh_speedup = reference_ms / fresh_ms if fresh_ms > 0 else 0.0
+    steady_speedup = reference_ms / steady_ms if steady_ms > 0 else 0.0
+    passed = fresh_speedup > 1.0 and steady_speedup > 1.0
+    return {
+        "status": "PASS" if passed else "FAIL",
+        "correctness": "PASS",
+        "variants": variants,
+        "reference_sequence_us": reference_ms * 1000.0,
+        "fresh_candidate_sequence_us": fresh_ms * 1000.0,
+        "steady_candidate_sequence_us": steady_ms * 1000.0,
+        "fresh_input_speedup": fresh_speedup,
+        "steady_input_speedup": steady_speedup,
+        "reason": (
+            "fresh and steady dispatch both beat the configured baseline"
+            if passed
+            else "candidate did not beat the configured baseline under both "
+            "fresh-identity and steady repeated dispatch"
+        ),
+    }
+
+
 def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
                     sizes_filter: str = "all",
                     corpus_cases: Optional[Sequence] = None,
                     corpus_only: bool = False,
-                    baseline: str = "eager") -> dict:
+                    baseline: str = "eager",
+                    dispatch_stress: bool = False) -> dict:
     """Run performance benchmarks. Returns dict with metrics.
 
     ``corpus_cases`` appends production shapes (each benchmarked once; their
@@ -973,6 +1107,8 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
 
     all_results = []
     primary_result = None
+    primary_stress_config: tuple[Mapping[str, int], torch.dtype] | None = None
+    last_stress_config: tuple[Mapping[str, int], torch.dtype] | None = None
 
     for label, sz, dtype, weight, source in bench_configs:
         print(f"\n  Benchmarking: {label} ...")
@@ -1040,9 +1176,11 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
                 "speedup_vs_pytorch": speedup,
             }
             all_results.append(entry)
+            last_stress_config = (dict(sz), dtype)
 
             if label == primary_label:
                 primary_result = entry
+                primary_stress_config = last_stress_config
 
             print(f"    kernel: {kernel_us:.2f} us | pytorch: {ref_us:.2f} us | "
                   f"speedup: {speedup:.3f}x | {throughput_tflops:.3f} TFLOPS | "
@@ -1066,6 +1204,26 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
     # If we didn't bench the primary size, use the last successful one
     if primary_result is None and all_results:
         primary_result = all_results[-1]
+        primary_stress_config = last_stress_config
+
+    dispatch_result = None
+    if dispatch_stress and primary_stress_config is not None:
+        stress_size, stress_dtype = primary_stress_config
+        try:
+            dispatch_result = run_dispatch_stress(
+                kernel_fn,
+                spec,
+                size_map=stress_size,
+                dtype=stress_dtype,
+                baseline=baseline,
+            )
+        except Exception as exc:
+            dispatch_result = {
+                "status": "FAIL",
+                "correctness": "FAIL",
+                "variants": 4,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
 
     # Weighted aggregate reporting for corpus cases, grouped per dtype so
     # results from different dtypes are never mixed into one aggregate.
@@ -1095,6 +1253,7 @@ def run_performance(kernel_fn: Callable, spec: KernelSpec, gpu: GPUSpec,
         "primary": primary_result,
         "all": all_results,
         "corpus": corpus_summary,
+        "dispatch_stress": dispatch_result,
         "baseline_mode": baseline,
     }
 
@@ -1200,6 +1359,14 @@ def main():
         ),
     )
     parser.add_argument(
+        "--dispatch-stress",
+        action="store_true",
+        help=(
+            "Require fresh-identity and repeated-dispatch correctness and "
+            "performance. Campaign search enables this automatically."
+        ),
+    )
+    parser.add_argument(
         "--parity-policy",
         choices=tuple(sorted(KNOWN_POLICIES)),
         default="tolerance",
@@ -1294,6 +1461,7 @@ def main():
         corpus_cases = _load_validated_corpus(args, spec)
 
     try:
+        validate_candidate_execution_policy()
         kernel_module = load_candidate_module()
         kernel_fn = kernel_module.kernel_fn
 
@@ -1467,6 +1635,7 @@ def main():
             kernel_fn, spec, gpu, sizes_filter=sizes_filter,
             corpus_cases=corpus_cases, corpus_only=args.shape_corpus_only,
             baseline=args.baseline,
+            dispatch_stress=args.dispatch_stress,
         )
         peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
     except Exception as e:
@@ -1569,6 +1738,7 @@ def main():
             "check_backward": backward_requested,
             "check_compile": compile_requested,
             "baseline_mode": args.baseline,
+            "dispatch_stress": args.dispatch_stress,
             "parity_policy": _PARITY_POLICY.as_dict(),
         },
         gpu=asdict(gpu),
